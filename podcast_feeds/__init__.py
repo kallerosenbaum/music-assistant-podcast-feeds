@@ -187,20 +187,24 @@ class PodcastFeedsProvider(MusicProvider):
         self, search_query: str, media_types: list[MediaType], limit: int = 10
     ) -> SearchResults:
         """
-        Look up a podcast by its feed url.
+        Search podcasts by feed url, or by the titles of their episodes.
 
-        Typing or pasting a feed url into the search returns that podcast, which can then be
-        added to the library (and so to this provider's feed list).
+        A feed url returns that podcast, which can then be added to the library (and so to
+        this provider's feed list). Any other query returns the subscribed podcasts with an
+        episode whose title contains every word of the query: search results have no place
+        for episodes, so this leads to the podcast, where its episodes can be filtered.
         """
         result = SearchResults()
         if MediaType.PODCAST not in media_types:
             return result
-        if (feed_url := normalize_feed_url(restore_search_url(search_query))) is None:
+        query = restore_search_url(search_query)
+        if (feed_url := normalize_feed_url(query)) is not None:
+            try:
+                result.podcasts = [await self.get_podcast(feed_url)]
+            except MediaNotFoundError as err:
+                self.logger.debug("Search: %s is not a usable podcast feed: %s", feed_url, err)
             return result
-        try:
-            result.podcasts = [await self.get_podcast(feed_url)]
-        except MediaNotFoundError as err:
-            self.logger.debug("Search: %s is not a usable podcast feed: %s", feed_url, err)
+        result.podcasts = await self._search_episode_titles(query, limit)
         return result
 
     async def library_add(self, item: MediaItemType) -> bool:
@@ -327,6 +331,38 @@ class PodcastFeedsProvider(MusicProvider):
             provider_instance_id=self.instance_id,
             feed_url=feed_url,
         )
+
+    async def _search_episode_titles(self, query: str, limit: int) -> list[Podcast]:
+        """
+        Return the subscribed podcasts with an episode title containing every query word.
+
+        Podcasts are returned in the configured order. A feed that cannot be loaded is
+        skipped, so one broken feed does not break the search.
+
+        :param query: The search query; matching ignores case.
+        :param limit: Maximum number of podcasts to return.
+        """
+        words = query.casefold().split()
+        if not words or limit <= 0:
+            return []
+        feed_urls = self._get_feed_urls()
+        # read concurrently: a feed missing from the cache is fetched over the network
+        feeds = await asyncio.gather(
+            *(self._get_feed(x) for x in feed_urls), return_exceptions=True
+        )
+        podcasts: list[Podcast] = []
+        for feed_url, parsed_feed in zip(feed_urls, feeds, strict=True):
+            if isinstance(parsed_feed, BaseException):
+                if not isinstance(parsed_feed, MediaNotFoundError):
+                    raise parsed_feed
+                self.logger.debug("Search: skipping feed %s: %s", feed_url, parsed_feed)
+                continue
+            titles = (str(x.get("title") or "").casefold() for x in parsed_feed.get("episodes", []))
+            if any(all(word in title for word in words) for title in titles):
+                podcasts.append(self._parse_podcast(feed_url, parsed_feed))
+                if len(podcasts) >= limit:
+                    break
+        return podcasts
 
     async def _refresh_feeds(
         self, feed_urls: list[str]

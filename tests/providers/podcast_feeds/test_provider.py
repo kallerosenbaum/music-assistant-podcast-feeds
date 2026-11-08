@@ -25,13 +25,14 @@ def _as_server_sends(query: str) -> str:
 
 FEED_A = "https://example.com/a.xml"
 FEED_B = "https://example.org/b.xml"
+FEED_C = "https://example.net/c.xml"
 
 
-def _episode(guid: str, published: int) -> dict[str, Any]:
+def _episode(guid: str, published: int, title: str | None = None) -> dict[str, Any]:
     """Return a minimal podcastparser episode dict with a valid enclosure."""
     return {
         "guid": guid,
-        "title": f"Episode {guid}",
+        "title": title or f"Episode {guid}",
         "published": published,
         "enclosures": [{"url": f"https://cdn.example.com/{guid}.mp3"}],
     }
@@ -43,6 +44,13 @@ FEEDS: dict[str, dict[str, Any]] = {
         "episodes": [_episode("a2", 200), _episode("a3", 300), _episode("a1", 100)],
     },
     FEED_B: {"title": "Show B", "episodes": [_episode("b1", 100)]},
+    FEED_C: {
+        "title": "Show C",
+        "episodes": [
+            _episode("c1", 100, "How surveillance crept up on us"),
+            _episode("c2", 200, "Inside the insurance lab"),
+        ],
+    },
 }
 
 
@@ -153,14 +161,34 @@ async def test_get_episode_and_stream() -> None:
 
 
 async def test_search_by_feed_url() -> None:
-    """Searching a feed url returns that podcast; other queries return nothing."""
+    """Searching a feed url returns that podcast, subscribed or not."""
     provider = _provider([])
     result = await provider.search(FEED_B, [MediaType.PODCAST])
     assert [p.name for p in result.podcasts] == ["Show B"]
     # the music controller replaces "/" with spaces before calling the provider
     result = await provider.search(_as_server_sends(FEED_B), [MediaType.PODCAST])
     assert [p.item_id for p in result.podcasts] == [FEED_B]
-    assert not (await provider.search("show b", [MediaType.PODCAST])).podcasts
+
+
+async def test_search_by_episode_title() -> None:
+    """Text finds the subscribed podcasts with an episode title holding every word."""
+    provider = _provider(["https://example.net/broken.xml", FEED_A, FEED_B, FEED_C])
+
+    async def names(query: str, limit: int = 10) -> list[str]:
+        result = await provider.search(query, [MediaType.PODCAST], limit)
+        return [p.name for p in result.podcasts]
+
+    assert await names("crept") == ["Show C"]
+    # case and word order do not matter, every word has to match
+    assert await names("  US Surveillance ") == ["Show C"]
+    assert await names("surveillance insurance") == []
+    # every matching podcast, in the configured order, the broken feed skipped
+    assert await names("episode") == ["Show A", "Show B"]
+    assert await names("episode", limit=1) == ["Show A"]
+    # a feed not in the list is never searched by text
+    assert not (await _provider([FEED_A]).search("crept", [MediaType.PODCAST])).podcasts
+    # other media types only
+    assert not (await provider.search("crept", [MediaType.TRACK])).podcasts
 
 
 async def test_library_add_and_remove() -> None:

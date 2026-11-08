@@ -66,6 +66,10 @@ You can also:
 - **Add from search:** paste a feed URL into the search box and add the resulting podcast to
   your library. The URL is appended to Feed URLs.
 - **Remove:** remove the podcast from your library, or delete its URL from Feed URLs.
+- **Find an episode:** search for words from its title. Music Assistant's search has no place
+  for episodes, so the results list the *podcasts* that have an episode whose title contains
+  every word you typed (any order, any case). Open the podcast and use the search icon above
+  its episode list to get to the episode itself. Show notes aren't searched.
 
 `feed://`, `itpc://`, `pcast://` and `podcast://` links are accepted too and are converted to
 `http(s)`. Feeds are cached for 24 hours and refreshed on every library sync. A feed that fails
