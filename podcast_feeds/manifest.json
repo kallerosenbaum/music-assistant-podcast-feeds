@@ -1,0 +1,11 @@
+{
+  "type": "music",
+  "domain": "podcast_feeds",
+  "stage": "beta",
+  "name": "Podcast Feeds",
+  "description": "Subscribe to any number of podcasts by their RSS feeds in a single provider.",
+  "codeowners": ["@kallerosenbaum"],
+  "tier": "community",
+  "requirements": [],
+  "multi_instance": true
+}

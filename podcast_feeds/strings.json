@@ -1,0 +1,11 @@
+{
+  "config_entries": {
+    "feed_urls": {
+      "label": "Feed URLs",
+      "description": "The RSS feed URLs of the podcasts to subscribe to. Press Enter after each URL. You can also paste a feed URL into the search and add the podcast to your library."
+    }
+  },
+  "manifest": {
+    "description": "Subscribe to any number of podcasts by their RSS feeds in a single provider."
+  }
+}
