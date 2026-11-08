@@ -30,6 +30,9 @@ volumes:
 It has no extra requirements: it uses `podcastparser` and the shared
 `music_assistant.helpers.podcast_parsers` module that Music Assistant already ships.
 
+It works with Music Assistant 2.10.9 and later. Episode transcripts need 2.11 or later; on
+older servers everything else works.
+
 ### Settings labels
 
 The server doesn't read a provider's `strings.json` at runtime. It reads labels from one

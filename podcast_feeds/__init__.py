@@ -52,10 +52,8 @@ from music_assistant.helpers.countries import get_country_codes
 from music_assistant.helpers.podcast_parsers import (
     enrich_episode_chapters,
     find_episode_stream_url,
-    find_episode_transcripts,
     get_cached_podcast,
     get_episode_positions,
-    get_episode_transcript,
     get_stream_url_and_guid_from_episode,
     parse_podcast,
     parse_podcast_episode,
@@ -63,6 +61,17 @@ from music_assistant.helpers.podcast_parsers import (
 )
 from music_assistant.helpers.throttle_retry import ThrottlerManager, throttle_with_retries
 from music_assistant.models.music_provider import MusicProvider
+
+try:
+    from music_assistant.helpers.podcast_parsers import (
+        find_episode_transcripts,
+        get_episode_transcript,
+    )
+
+    HAS_TRANSCRIPTS = True
+except ImportError:
+    # transcripts arrived in Music Assistant 2.11; older servers never ask for them
+    HAS_TRANSCRIPTS = False
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
@@ -370,6 +379,8 @@ class PodcastFeedsProvider(MusicProvider):
         self, prov_episode_id: str
     ) -> tuple[str | None, list[MediaItemTranscriptCue] | None]:
         """Get the transcript for a podcast episode."""
+        if not HAS_TRANSCRIPTS:
+            return None, None
         feed_url, guid_or_stream_url = split_episode_id(prov_episode_id)
         parsed_feed = await self._get_feed(feed_url)
         return await get_episode_transcript(
