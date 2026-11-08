@@ -9,10 +9,13 @@ from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import MediaNotFoundError
 
 from music_assistant.providers.podcast_feeds import (
+    CONF_COUNTRY,
+    CONF_DIRECTORY_SEARCH,
     CONF_FEED_URLS,
     SUPPORTED_FEATURES,
     PodcastFeedsProvider,
     normalize_feed_url,
+    parse_directory_result,
     restore_search_url,
     split_episode_id,
 )
@@ -54,19 +57,49 @@ FEEDS: dict[str, dict[str, Any]] = {
 }
 
 
-def _provider(feed_urls: list[str]) -> PodcastFeedsProvider:
+# what the Apple Podcasts directory finds, by search term
+DIRECTORY: dict[str, list[dict[str, Any]]] = {
+    "crept": [
+        {"collectionName": "Show C", "feedUrl": FEED_C},
+        {
+            "collectionName": "Creepy Tales",
+            "artistName": "Tellers",
+            "feedUrl": "https://example.com/creepy.xml",
+            "artworkUrl100": "https://img.example.com/100.jpg",
+            "artworkUrl600": "https://img.example.com/600.jpg",
+            "trackCount": 42,
+        },
+        {"collectionName": "No Feed"},
+    ],
+}
+
+
+def _provider(
+    feed_urls: list[str], directory_search: bool = False, country: str = "se"
+) -> PodcastFeedsProvider:
     """Return a provider configured with the given feed urls, without a real mass."""
     mass = Mock()
     manifest = Mock(domain="podcast_feeds")
     config = Mock(instance_id="podcast_feeds--test", enabled=True)
     config.values = {}
-    stored = {CONF_FEED_URLS: feed_urls}
+    stored: dict[str, Any] = {
+        CONF_FEED_URLS: feed_urls,
+        CONF_DIRECTORY_SEARCH: directory_search,
+        CONF_COUNTRY: country,
+    }
     config.get_value.side_effect = lambda key, default=None: (
         "INFO" if key == "log_level" else stored.get(key, default)
     )
     provider = PodcastFeedsProvider(mass, manifest, config, SUPPORTED_FEATURES)
     provider._update_config_value = Mock(  # type: ignore[method-assign]
         side_effect=lambda key, value, **_: stored.__setitem__(key, value)
+    )
+
+    async def fake_itunes_search(query: str, _country: str, limit: int) -> list[dict[str, Any]]:
+        return DIRECTORY.get(query, [])[:limit]
+
+    provider._itunes_search = AsyncMock(  # type: ignore[method-assign]
+        side_effect=fake_itunes_search
     )
     return provider
 
@@ -200,3 +233,50 @@ async def test_library_add_and_remove() -> None:
     assert provider._get_feed_urls() == [FEED_A, FEED_B]
     assert await provider.library_remove(FEED_A, MediaType.PODCAST)
     assert provider._get_feed_urls() == [FEED_B]
+
+
+def test_parse_directory_result() -> None:
+    """A directory result becomes a podcast with its feed url as id, or None without one."""
+    podcast = parse_directory_result(DIRECTORY["crept"][1], "podcast_feeds--test", "podcast_feeds")
+    assert podcast is not None
+    assert podcast.item_id == "https://example.com/creepy.xml"
+    assert (podcast.name, podcast.publisher, podcast.total_episodes) == (
+        "Creepy Tales",
+        "Tellers",
+        42,
+    )
+    assert [x.path for x in podcast.metadata.images or []] == ["https://img.example.com/600.jpg"]
+    assert parse_directory_result({"collectionName": "No Feed"}, "x", "y") is None
+    assert parse_directory_result({"feedUrl": FEED_A}, "x", "y") is None
+
+
+async def test_search_directory() -> None:
+    """Directory results follow the subscribed matches, without duplicates."""
+    provider = _provider([FEED_C], directory_search=True)
+    result = await provider.search("crept", [MediaType.PODCAST])
+    assert [p.item_id for p in result.podcasts] == [FEED_C, "https://example.com/creepy.xml"]
+    provider._itunes_search.assert_awaited_once_with("crept", "se", 10)  # type: ignore[attr-defined]
+    # a pasted feed url does not query the directory
+    await provider.search(FEED_B, [MediaType.PODCAST])
+    assert provider._itunes_search.await_count == 1  # type: ignore[attr-defined]
+
+
+async def test_search_directory_off_or_failing() -> None:
+    """With directory search off, or the directory failing, the feeds are still searched."""
+    provider = _provider([FEED_C])
+    result = await provider.search("crept", [MediaType.PODCAST])
+    assert [p.item_id for p in result.podcasts] == [FEED_C]
+    provider._itunes_search.assert_not_awaited()  # type: ignore[attr-defined]
+
+    provider = _provider([FEED_C], directory_search=True)
+    provider._itunes_search.side_effect = TimeoutError()  # type: ignore[attr-defined]
+    result = await provider.search("crept", [MediaType.PODCAST])
+    assert [p.item_id for p in result.podcasts] == [FEED_C]
+
+
+async def test_add_directory_result_to_library() -> None:
+    """Adding a podcast found in the directory stores its feed url."""
+    provider = _provider([FEED_A], directory_search=True)
+    result = await provider.search("crept", [MediaType.PODCAST])
+    assert await provider.library_add(result.podcasts[-1])
+    assert provider._get_feed_urls() == [FEED_A, "https://example.com/creepy.xml"]

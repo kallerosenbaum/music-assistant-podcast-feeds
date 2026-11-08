@@ -7,7 +7,8 @@ library with all its episodes browsable and playable.
 
 Feeds can be managed in three ways:
 - edit the "Feed URLs" list in the provider settings,
-- paste a feed URL into the search and add the resulting podcast to the library,
+- find a podcast with the search (by name in the Apple Podcasts directory, or by pasting
+  its feed URL) and add it to the library,
 - remove a podcast from the library, which drops its feed from the list.
 
 Item ids:
@@ -22,11 +23,13 @@ from collections.abc import AsyncGenerator, Iterator
 from itertools import islice
 from typing import TYPE_CHECKING, Any
 
+import aiohttp
 import podcastparser
-from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import (
     ConfigEntryType,
     ContentType,
+    ImageType,
     MediaType,
     ProviderFeature,
     StreamType,
@@ -34,13 +37,18 @@ from music_assistant_models.enums import (
 from music_assistant_models.errors import MediaNotFoundError
 from music_assistant_models.media_items import (
     AudioFormat,
+    MediaItemImage,
     MediaItemTranscriptCue,
     Podcast,
     PodcastEpisode,
+    ProviderMapping,
     SearchResults,
+    UniqueList,
 )
 from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.controllers.cache import use_cache
+from music_assistant.helpers.countries import get_country_codes
 from music_assistant.helpers.podcast_parsers import (
     enrich_episode_chapters,
     find_episode_stream_url,
@@ -53,6 +61,7 @@ from music_assistant.helpers.podcast_parsers import (
     parse_podcast_episode,
     refresh_cached_podcast,
 )
+from music_assistant.helpers.throttle_retry import ThrottlerManager, throttle_with_retries
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
@@ -64,6 +73,19 @@ if TYPE_CHECKING:
     from music_assistant.models import ProviderInstanceType
 
 CONF_FEED_URLS = "feed_urls"
+CONF_DIRECTORY_SEARCH = "directory_search"
+CONF_COUNTRY = "country"
+
+# Apple Podcasts directory (iTunes Search API), needs no account or key
+ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
+# Apple allows about 20 requests a minute, stay below like the itunes_podcasts provider
+ITUNES_RATE_LIMIT = 18
+ITUNES_RATE_PERIOD = 60
+ITUNES_TIMEOUT = 10
+# store to search when the server's region has no matching store
+DEFAULT_COUNTRY = "us"
+# the directory changes slowly; Music Assistant caches whole searches for minutes on top
+DIRECTORY_CACHE_EXPIRATION = 60 * 60 * 24
 
 # number of feeds fetched in parallel during a library sync
 FEED_REFRESH_CONCURRENCY = 5
@@ -153,11 +175,64 @@ def iter_episodes(
         yield position, episode, guid if guid is not None else stream_url
 
 
+def parse_directory_result(result: dict[str, Any], instance_id: str, domain: str) -> Podcast | None:
+    """
+    Return a podcast for an Apple Podcasts directory search result, None without a feed url.
+
+    The item id is the feed url, as for a subscribed podcast, so the result opens like any
+    feed and adding it to the library stores the url in the feed list.
+
+    :param result: One entry of the iTunes Search API "results" list.
+    :param instance_id: The provider instance id.
+    :param domain: The provider domain.
+    """
+    feed_url = normalize_feed_url(str(result.get("feedUrl") or ""))
+    name = result.get("collectionName") or result.get("trackName")
+    if feed_url is None or not name:
+        return None
+    podcast = Podcast(
+        item_id=feed_url,
+        name=str(name),
+        publisher=result.get("artistName"),
+        provider=instance_id,
+        provider_mappings={
+            ProviderMapping(
+                item_id=feed_url,
+                provider_domain=domain,
+                provider_instance=instance_id,
+            )
+        },
+    )
+    artwork = next(
+        (result[x] for x in ("artworkUrl600", "artworkUrl100", "artworkUrl60") if result.get(x)),
+        None,
+    )
+    if artwork is not None:
+        podcast.metadata.images = UniqueList(
+            [
+                MediaItemImage(
+                    type=ImageType.THUMB,
+                    path=str(artwork),
+                    provider=instance_id,
+                    remotely_accessible=True,
+                )
+            ]
+        )
+    if result.get("trackCount"):
+        podcast.total_episodes = int(result["trackCount"])
+    return podcast
+
+
 class PodcastFeedsProvider(MusicProvider):
     """Music provider serving any number of podcast RSS feeds."""
 
+    throttler: ThrottlerManager
+
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
+        country_codes = await asyncio.to_thread(get_country_codes)
+        # the store decides which catalog is searched; default to the server's region
+        region = self.mass.metadata.locale.split("_")[-1].upper()
         return (
             ConfigEntry(
                 key=CONF_FEED_URLS,
@@ -166,10 +241,30 @@ class PodcastFeedsProvider(MusicProvider):
                 default_value=[],
                 required=False,
             ),
+            ConfigEntry(
+                key=CONF_DIRECTORY_SEARCH,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=True,
+                required=False,
+            ),
+            ConfigEntry(
+                key=CONF_COUNTRY,
+                type=ConfigEntryType.STRING,
+                options=[
+                    ConfigValueOption(title=name, value=code.lower())
+                    for code, name in sorted(country_codes.items(), key=lambda x: x[1])
+                ],
+                default_value=region.lower() if region in country_codes else DEFAULT_COUNTRY,
+                required=False,
+                depends_on=CONF_DIRECTORY_SEARCH,
+            ),
         )
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
+        self.throttler = ThrottlerManager(
+            rate_limit=ITUNES_RATE_LIMIT, period=ITUNES_RATE_PERIOD, retry_attempts=1
+        )
         invalid = [x for x in self._get_stored_feeds() if normalize_feed_url(x) is None]
         for url in invalid:
             self.logger.warning("Ignoring invalid podcast feed url: %s", url)
@@ -187,12 +282,13 @@ class PodcastFeedsProvider(MusicProvider):
         self, search_query: str, media_types: list[MediaType], limit: int = 10
     ) -> SearchResults:
         """
-        Search podcasts by feed url, or by the titles of their episodes.
+        Search podcasts by feed url, by the titles of their episodes, or in the directory.
 
         A feed url returns that podcast, which can then be added to the library (and so to
         this provider's feed list). Any other query returns the subscribed podcasts with an
-        episode whose title contains every word of the query: search results have no place
-        for episodes, so this leads to the podcast, where its episodes can be filtered.
+        episode whose title contains every word of the query (search results have no place
+        for episodes, so this leads to the podcast, where its episodes can be filtered),
+        followed by the matching podcasts of the Apple Podcasts directory.
         """
         result = SearchResults()
         if MediaType.PODCAST not in media_types:
@@ -204,7 +300,11 @@ class PodcastFeedsProvider(MusicProvider):
             except MediaNotFoundError as err:
                 self.logger.debug("Search: %s is not a usable podcast feed: %s", feed_url, err)
             return result
-        result.podcasts = await self._search_episode_titles(query, limit)
+        subscribed, directory = await asyncio.gather(
+            self._search_episode_titles(query, limit), self._search_directory(query, limit)
+        )
+        seen = {x.item_id for x in subscribed}
+        result.podcasts = [*subscribed, *(x for x in directory if x.item_id not in seen)]
         return result
 
     async def library_add(self, item: MediaItemType) -> bool:
@@ -363,6 +463,51 @@ class PodcastFeedsProvider(MusicProvider):
                 if len(podcasts) >= limit:
                     break
         return podcasts
+
+    async def _search_directory(self, query: str, limit: int) -> list[Podcast]:
+        """
+        Return the podcasts the Apple Podcasts directory finds for the query.
+
+        Returns nothing when directory search is turned off, and on any failure, so the
+        directory being unreachable does not break the search of the subscribed feeds.
+
+        :param query: The search query.
+        :param limit: Maximum number of podcasts to return.
+        """
+        if not query.strip() or limit <= 0 or not self.config.get_value(CONF_DIRECTORY_SEARCH):
+            return []
+        country = str(self.config.get_value(CONF_COUNTRY) or DEFAULT_COUNTRY)
+        try:
+            results = await self._itunes_search(query, country, min(limit, 200))
+        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+            self.logger.warning("Apple Podcasts directory search failed: %s", err)
+            return []
+        podcasts = (parse_directory_result(x, self.instance_id, self.domain) for x in results or [])
+        return [x for x in podcasts if x is not None]
+
+    @use_cache(DIRECTORY_CACHE_EXPIRATION, cache_none=False)
+    @throttle_with_retries
+    async def _itunes_search(
+        self, query: str, country: str, limit: int
+    ) -> list[dict[str, Any]] | None:
+        """Return the raw iTunes Search API results, None on a failed request (not cached)."""
+        params: dict[str, str | int] = {
+            "media": "podcast",
+            "entity": "podcast",
+            "country": country,
+            "limit": limit,
+            "term": query,
+        }
+        async with self.mass.http_session.get(
+            ITUNES_SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=ITUNES_TIMEOUT)
+        ) as response:
+            if response.status != 200:
+                self.logger.warning("Apple Podcasts directory search returned %s", response.status)
+                return None
+            # Apple serves the json as text/javascript
+            data: Any = await response.json(content_type=None)
+        results = data.get("results") if isinstance(data, dict) else None
+        return [x for x in results if isinstance(x, dict)] if isinstance(results, list) else None
 
     async def _refresh_feeds(
         self, feed_urls: list[str]

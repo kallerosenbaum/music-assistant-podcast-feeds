@@ -63,8 +63,13 @@ still works, but shows no label or help text.
 
 You can also:
 
-- **Add from search:** paste a feed URL into the search box and add the resulting podcast to
-  your library. The URL is appended to Feed URLs.
+- **Find new podcasts:** search by name. Matching podcasts from the Apple Podcasts directory
+  are listed after your own. Open one to see its episodes, and add it to your library to
+  subscribe: its feed URL is appended to Feed URLs. Set the store in **Directory country**
+  (it defaults to your server's region). If you'd rather not send search terms to Apple,
+  turn off **Search the Apple Podcasts directory**. Directory results are cached for a day.
+- **Add by URL:** paste a feed URL into the search box and add the resulting podcast to
+  your library. Use this for feeds the directory doesn't list.
 - **Remove:** remove the podcast from your library, or delete its URL from Feed URLs.
 - **Find an episode:** search for words from its title. Music Assistant's search has no place
   for episodes, so the results list the *podcasts* that have an episode whose title contains

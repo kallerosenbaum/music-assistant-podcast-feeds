@@ -2,7 +2,15 @@
   "config_entries": {
     "feed_urls": {
       "label": "Feed URLs",
-      "description": "The RSS feed URLs of the podcasts to subscribe to. Press Enter after each URL. You can also paste a feed URL into the search and add the podcast to your library."
+      "description": "The RSS feed URLs of the podcasts to subscribe to. Press Enter after each URL. You can also find a podcast with the search and add it to your library."
+    },
+    "directory_search": {
+      "label": "Search the Apple Podcasts directory",
+      "description": "Also show matching podcasts from the Apple Podcasts directory in search results, so you can find new podcasts by name and add them. Your search terms are sent to Apple."
+    },
+    "country": {
+      "label": "Directory country",
+      "description": "The Apple Podcasts store to search. Podcasts available in other countries may not show up."
     }
   },
   "manifest": {
